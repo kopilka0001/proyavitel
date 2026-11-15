@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Проявитель+ — тест микрофона</title>
+<style>
+    body {
+        font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        background: #1a1a1a;
+        color: #eee;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-height: 100vh;
+        margin: 0;
+        padding: 24px 16px;
+        box-sizing: border-box;
+        text-align: center;
+    }
+    h1 {
+        color: #f0c987;
+        font-weight: 500;
+        font-size: 1.6rem;
+        margin: 0 0 20px;
+    }
+    button {
+        background: #f0c987;
+        color: #1a1a1a;
+        border: none;
+        padding: 14px 32px;
+        font-size: 1.1rem;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 600;
+        transition: background 0.2s;
+    }
+    button:hover { background: #e0b870; }
+    button:disabled { background: #555; cursor: not-allowed; }
+
+    #status {
+        margin: 16px 0 8px;
+        font-size: 1rem;
+        color: #bbb;
+        min-height: 1.4em;
+    }
+
+    /* Вертикальная полоска громкости */
+    #barWrap {
+        width: 64px;
+        height: 320px;
+        border: 2px solid #444;
+        border-radius: 8px;
+        position: relative;
+        overflow: hidden;
+        background: #222;
+        margin: 12px auto 8px;
+    }
+    #barFill {
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: 0%;
+        background: linear-gradient(to top, #4caf50 0%, #ffeb3b 60%, #f44336 100%);
+        transition: height 0.05s linear;
+    }
+
+    #rmsText {
+        font-family: ui-monospace, Consolas, monospace;
+        font-size: 1.1rem;
+        color: #a0d8a0;
+        margin: 8px 0 16px;
+        min-height: 1.4em;
+    }
+
+    #errorBox {
+        display: none;
+        background: #4a1f1f;
+        border: 1px solid #a33;
+        color: #ffb0b0;
+        padding: 14px 18px;
+        border-radius: 8px;
+        max-width: 520px;
+        margin-top: 16px;
+        line-height: 1.5;
+        text-align: left;
+    }
+</style>
+</head>
+<body>
+
+    <h1>Тест микрофона</h1>
+
+    <button id="startBtn">Разрешить микрофон</button>
+
+    <div id="status">Нажмите кнопку, чтобы начать</div>
+
+    <div id="barWrap">
+        <div id="barFill"></div>
+    </div>
+
+    <div id="rmsText">0.0000</div>
+
+    <div id="errorBox"></div>
+
+    <script>
+    (function () {
+        'use strict';
+
+        const startBtn = document.getElementById('startBtn');
+        const statusEl = document.getElementById('status');
+        const barFill = document.getElementById('barFill');
+        const rmsText = document.getElementById('rmsText');
+        const errorBox = document.getElementById('errorBox');
+
+        // Состояние
+        let audioContext = null;   // создаётся строго в обработчике клика
+        let analyser = null;
+        let dataArray = null;
+        let pollTimer = null;
+        let smoothedRms = 0;
+
+        // Сглаживание в стиле VU-метра: быстро вверх, медленно вниз
+        const SMOOTH_ATTACK = 0.7;   // доля нового значения при росте
+        const SMOOTH_RELEASE = 0.1;  // доля нового значения при падении
+
+        // Переводит сырой RMS (обычно 0.001…0.3) в проценты высоты полоски.
+        // Если полоска слишком чувствительная или слишком вялая —
+        // это единственное число, которое нужно подкрутить.
+        const BAR_MULTIPLIER = 500;
+
+        // Проверяем поддержку API сразу при загрузке страницы
+        if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+            showError('Браузер слишком старый: метод getUserMedia недоступен. ' +
+                      'Откройте страницу в свежем Chrome, Firefox или Safari. ' +
+                      'Также проверьте, что страница открыта через https:// или localhost ' +
+                      '(не через file://).');
+            startBtn.disabled = true;
+        }
+
+        startBtn.addEventListener('click', handleStart);
+
+        // === Главный обработчик клика ===
+        async function handleStart() {
+            // Если контекст уже существует — только resume(), новый НЕ создаём
+            if (audioContext) {
+                if (audioContext.state === 'suspended') {
+                    try {
+                        await audioContext.resume();
+                        statusEl.textContent = 'Продолжаем слушать...';
+                    } catch (e) {
+                        showError('Не удалось возобновить аудио: ' + e.message);
+                    }
+                }
+                return;
+            }
+
+            // 1. Создаём AudioContext строго в обработчике клика.
+            //    Браузеры не дают запускать звук без жеста пользователя.
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) {
+                showError('Браузер не поддерживает AudioContext. Попробуйте свежий Chrome.');
+                return;
+            }
+            try {
+                audioContext = new Ctx();
+            } catch (e) {
+                showError('Не удалось создать AudioContext: ' + e.message);
+                return;
+            }
+
+            // 2. Запрашиваем микрофон.
+            //    ВАЖНО: звук НЕ записывается в файл и никуда не отправляется.
+            //    Поток живёт только в памяти этой страницы, пока она открыта.
+            //    Никаких сетевых запросов, никаких сохранений — только чтение
+            //    уровня громкости для отрисовки полоски.
+            let stream;
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (err) {
+                // Закрываем контекст, чтобы при следующей попытке всё было чисто
+                try { await audioContext.close(); } catch (_) {}
+                audioContext = null;
+                handleMicError(err);
+                return;
+            }
+
+            // 3. Создаём источник из микрофонного потока
+            const source = audioContext.createMediaStreamSource(stream);
+
+            // 4. Анализатор с fftSize 2048
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 2048;
+            source.connect(analyser);
+
+            dataArray = new Float32Array(analyser.fftSize);
+
+            // 5. Готово к опросу
+            statusEl.textContent = 'Слушаем. Говорите, дышите или смейтесь.';
+            startBtn.textContent = 'Слушаем...';
+
+            // 6. Опрос раз в 50 мс (≈20 раз в секунду)
+            pollTimer = setInterval(pollRms, 50);
+        }
+
+        // === Чтение RMS и отрисовка полоски ===
+        function pollRms() {
+            if (!analyser || !dataArray) return;
+
+            // Временной ряд: значения от -1 до 1
+            analyser.getFloatTimeDomainData(dataArray);
+
+            // RMS = корень из среднего квадратов
+            let sumSquares = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+                const v = dataArray[i];
+                sumSquares += v * v;
+            }
+            const rms = Math.sqrt(sumSquares / dataArray.length);
+
+            // Сглаживание в стиле VU-метра:
+            // при росте берём много нового значения (быстро вверх),
+            // при падении — мало (медленно вниз).
+            if (rms > smoothedRms) {
+                smoothedRms = smoothedRms * (1 - SMOOTH_ATTACK) + rms * SMOOTH_ATTACK;
+            } else {
+                smoothedRms = smoothedRms * (1 - SMOOTH_RELEASE) + rms * SMOOTH_RELEASE;
+            }
+
+            // В проценты высоты и на экран
+            const percent = Math.min(100, smoothedRms * BAR_MULTIPLIER);
+            barFill.style.height = percent + '%';
+
+            // Числовое значение — на экран и в консоль (как требует задание)
+            const value = smoothedRms.toFixed(4);
+            rmsText.textContent = value;
+            console.log('RMS:', value, '| полоска:', percent.toFixed(0) + '%');
+        }
+
+        // === Обработка ошибок микрофона ===
+        function handleMicError(err) {
+            const name = err && err.name ? err.name : 'Unknown';
+            if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+                showError('Доступ к микрофону запрещён. Как включить: ' +
+                          'нажмите на иконку замка в адресной строке → «Микрофон» → ' +
+                          '«Разрешить» → перезагрузите страницу.');
+                statusEl.textContent = 'Доступ запрещён';
+            } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+                showError('Микрофон не найден. Подключите гарнитуру или проверьте ' +
+                          'настройки звука в системе.');
+                statusEl.textContent = 'Микрофон не найден';
+            } else if (name === 'NotReadableError') {
+                showError('Микрофон занят другой программой (Zoom, Discord и т.п.). ' +
+                          'Закройте её и обновите страницу.');
+                statusEl.textContent = 'Микрофон занят';
+            } else {
+                showError('Ошибка микрофона: ' + name + ' — ' + (err.message || ''));
+                statusEl.textContent = 'Ошибка';
+            }
+        }
+
+        function showError(text) {
+            errorBox.textContent = text;
+            errorBox.style.display = 'block';
+        }
+    })();
+    </script>
+
+</body>
+</html>
